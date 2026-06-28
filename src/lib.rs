@@ -13,11 +13,15 @@ pub const MODULE_ID: &str = "gms";
 /// Crate version resolved at compile time.
 pub const MODULE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+pub mod hal;
 pub mod adaptive_buffer;
 pub mod bridge;
 pub mod compression;
 pub mod hardware;
+pub mod scheduler;
+pub mod mps_bridge;
 pub mod multi_gpu_runtime;
+pub mod compiler;
 pub mod render_benchmark;
 pub mod scene_workload;
 pub mod snapshot_compressor;

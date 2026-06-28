@@ -3,7 +3,7 @@
 //! The scoring model is intentionally heuristic because `wgpu` does not expose
 //! raw CU/SM counts or VRAM size on every backend. We therefore combine:
 //! - adapter name parsing (best-effort CU/SM and VRAM hints)
-//! - `wgpu::AdapterInfo` device type (discrete/integrated/virtual)
+//! - `crate::hal::AdapterInfo` device type (discrete/integrated/virtual)
 //! - `wgpu` limits/features as capability hints
 //! - memory-topology penalties/bonuses
 
@@ -13,7 +13,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::OnceLock;
 
-use wgpu::{Adapter, AdapterInfo, Backends, DeviceType, Features, Instance, Limits};
+use crate::hal::{Adapter, AdapterInfo, Backend, DeviceType, Features, Limits, enumerate_adapters};
 
 const NVIDIA_VENDOR_ID: u32 = 0x10DE;
 const AMD_VENDOR_ID: u32 = 0x1002;
@@ -134,10 +134,10 @@ impl DeviceLimitClampReport {
     }
 }
 
-/// Clamp a requested `wgpu::Limits` set to the adapter's supported limits.
+/// Clamp a requested `crate::hal::Limits` set to the adapter's supported limits.
 ///
 /// This primarily protects device creation on mobile/embedded stacks (including some Panthor-based
-/// Mali/Immortalis systems) where `wgpu::Limits::default()` can request a larger
+/// Mali/Immortalis systems) where `crate::hal::Limits::default()` can request a larger
 /// `max_texture_dimension_3d` than the driver advertises.
 pub fn clamp_required_limits_to_supported(
     mut requested: Limits,
@@ -165,7 +165,7 @@ pub fn clamp_required_limits_to_supported(
     (requested, report)
 }
 
-/// Conservative, adapter-safe replacement for `wgpu::Limits::default()` device requests.
+/// Conservative, adapter-safe replacement for `crate::hal::Limits::default()` device requests.
 ///
 /// It starts from `Limits::default()` and clamps problematic texture dimensions to the adapter's
 /// supported values, preserving compatibility while avoiding accidental over-requests on mobile GPUs.
@@ -195,7 +195,7 @@ pub struct GpuAdapterProfile {
     pub name: String,
     pub vendor_id: u32,
     pub device_id: u32,
-    pub backend: wgpu::Backend,
+    pub backend: Backend,
     pub device_type: DeviceType,
     pub memory_topology: MemoryTopology,
     pub compute_unit_kind: ComputeUnitKind,
@@ -225,7 +225,7 @@ pub struct GpuAdapterProfile {
 impl GpuAdapterProfile {
     /// True when the adapter is a viable GPU target for compute-heavy GMS workloads.
     pub fn is_usable_gpu(&self) -> bool {
-        !matches!(self.device_type, DeviceType::Cpu)
+        !matches!(self.device_type.clone(), DeviceType::Cpu)
             && !matches!(self.memory_topology, MemoryTopology::System)
             && self.score > 0
     }
@@ -255,15 +255,9 @@ pub struct GpuInventory {
 }
 
 impl GpuInventory {
-    /// Discover all available adapters using `wgpu::Instance::enumerate_adapters`.
+    /// Discover all available adapters using `crate::hal::Instance::enumerate_adapters`.
     pub fn discover() -> Self {
-        let instance = Instance::default();
-        Self::discover_with_instance(&instance)
-    }
-
-    /// Discover adapters using a caller-provided instance.
-    pub fn discover_with_instance(instance: &Instance) -> Self {
-        let mut adapters = pollster::block_on(instance.enumerate_adapters(Backends::all()))
+        let mut adapters = enumerate_adapters()
             .into_iter()
             .enumerate()
             .map(|(index, adapter)| build_profile(index, &adapter))
@@ -309,7 +303,7 @@ fn build_profile(index: usize, adapter: &Adapter) -> GpuAdapterProfile {
     let name_lower = info.name.to_ascii_lowercase();
     let vendor_family = vendor_family(info.vendor, &name_lower);
     let device_type = info.device_type;
-    let memory_topology = classify_memory_topology(device_type, vendor_family, &name_lower);
+    let memory_topology = classify_memory_topology(device_type.clone(), vendor_family, &name_lower);
 
     let (estimated_compute_units, compute_unit_source, compute_unit_probe_note) =
         estimate_compute_units(&info, &limits, &name_lower, vendor_family);
@@ -346,12 +340,13 @@ fn build_profile(index: usize, adapter: &Adapter) -> GpuAdapterProfile {
     let thermal_headroom = estimate_thermal_headroom(vendor_family, memory_topology, &name_lower);
 
     GpuAdapterProfile {
+        
         index,
         name: info.name,
         vendor_id: info.vendor,
         device_id: info.device,
         backend: info.backend,
-        device_type,
+        device_type: device_type.clone(),
         memory_topology,
         compute_unit_kind,
         estimated_compute_units,
@@ -1320,7 +1315,7 @@ mod tests {
         parse_vulkaninfo_arm_shader_core_entries, vendor_family, MemoryTopology,
         NativeProbeOutcome, VendorFamily,
     };
-    use wgpu::DeviceType;
+    use crate::hal::DeviceType;
 
     #[test]
     fn parses_nvidia_rtx_5060_ti_sm() {
@@ -1410,8 +1405,8 @@ VkPhysicalDeviceShaderCorePropertiesARM:
 
     #[test]
     fn clamps_default_texture_limits_to_supported_adapter_limits() {
-        let requested = wgpu::Limits::default();
-        let mut supported = wgpu::Limits::default();
+        let requested = crate::hal::Limits::default();
+        let mut supported = crate::hal::Limits::default();
         supported.max_texture_dimension_1d = 4096;
         supported.max_texture_dimension_2d = 4096;
         supported.max_texture_dimension_3d = 512;
@@ -1447,7 +1442,7 @@ fn estimate_vram_mb(
     };
 
     let vendor_adjust_mb =
-        if matches!(info.device_type, DeviceType::IntegratedGpu) && name_lower.contains("apple") {
+        if matches!(info.device_type.clone(), DeviceType::IntegratedGpu) && name_lower.contains("apple") {
             8 * 1024
         } else {
             0
@@ -1612,15 +1607,13 @@ impl PartialEq for GpuAdapterProfile {
 impl Eq for GpuAdapterProfile {}
 
 impl PartialOrd for GpuAdapterProfile {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
 impl Ord for GpuAdapterProfile {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.score
-            .cmp(&other.score)
-            .then_with(|| self.index.cmp(&other.index))
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.index.cmp(&other.index)
     }
 }

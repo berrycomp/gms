@@ -244,23 +244,23 @@ impl AdaptiveBuffer {
         self.sxrc_compression_stats = stats;
     }
 
-    /// Attempt to acquire a CPU read lease using a mapped `wgpu::BufferView`.
+    /// Attempt to acquire a CPU read lease using a mapped `crate::hal::BufferView`.
     ///
     /// The requested byte size is derived from `view.len()`, which couples the arbiter directly
-    /// to `wgpu::BufferView` usage and reduces accidental mismatches in UMA accounting.
+    /// to `crate::hal::BufferView` usage and reduces accidental mismatches in UMA accounting.
     pub fn try_acquire_cpu_read_view(
         &mut self,
         key: SharedBufferKey,
-        view: &wgpu::BufferView,
+        view: &crate::hal::BufferView,
     ) -> Result<SharedBufferLease, SharedBufferLockError> {
         self.try_acquire_cpu_lease(key, view.len() as u64, SharedBufferOwner::CpuRead)
     }
 
-    /// Attempt to acquire a CPU write lease using a mapped `wgpu::BufferViewMut`.
+    /// Attempt to acquire a CPU write lease using a mapped `crate::hal::BufferViewMut`.
     pub fn try_acquire_cpu_write_view(
         &mut self,
         key: SharedBufferKey,
-        view: &wgpu::BufferViewMut,
+        view: &crate::hal::BufferViewMut,
     ) -> Result<SharedBufferLease, SharedBufferLockError> {
         self.try_acquire_cpu_lease(key, view.len() as u64, SharedBufferOwner::CpuWrite)
     }
@@ -577,9 +577,10 @@ impl AdaptiveBuffer {
     fn reconcile_uma_budgets(&mut self, frame_stddev_ms: f64, hardware_score_factor: f64) {
         let score_guard = (hardware_score_factor / 1.0).clamp(0.75, 1.5);
 
-        let base_cpu = (self.config.uma_cpu_map_budget_bytes as f64 * score_guard).round() as u64;
+        let hex4_multiplier = if self.config.sxrc_compression.active_policy() { 2.0 } else { 1.0 };
+        let base_cpu = (self.config.uma_cpu_map_budget_bytes as f64 * score_guard * hex4_multiplier).round() as u64;
         let base_gpu =
-            (self.config.uma_gpu_shared_budget_bytes as f64 * score_guard).round() as u64;
+            (self.config.uma_gpu_shared_budget_bytes as f64 * score_guard * hex4_multiplier).round() as u64;
 
         let (cpu_factor, gpu_factor) = if self.mode == AdaptiveBufferMode::StabilityRecovery {
             // Tighten budgets in recovery mode to reduce CPU/GPU overlap on shared UMA buffers.

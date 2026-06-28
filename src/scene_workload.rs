@@ -207,6 +207,7 @@ pub fn estimate_scene_workload(
         ),
         base_workgroup_size,
         target_frame_budget_ms,
+        hex4_enabled: false,
     };
 
     SceneWorkloadEstimate {

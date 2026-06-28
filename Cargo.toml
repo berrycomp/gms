@@ -4,7 +4,15 @@ version = "0.4.5"
 edition = "2021"
 
 [dependencies]
-wgpu = { workspace = true }
-winit = { workspace = true }
 sxrc = { path = "../sxrc" }
 pollster = "0.4.0"
+ash = "0.37"
+cudarc = "0.9"
+winit = "0.30"
+mps = { git = "https://github.com/berrycomp/mps" }
+wasmer = "7.0.1"
+wat = "1.0"
+wasmparser = "0.216"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = "0.27"

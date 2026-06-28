@@ -6,7 +6,7 @@
 
 #[cfg(target_os = "linux")]
 use std::path::Path;
-use wgpu::DeviceType;
+use crate::hal::DeviceType;
 
 /// Named performance mode for GMS tuning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -67,10 +67,10 @@ pub struct GmsRuntimeTuningProfile {
 }
 
 impl GmsRuntimeTuningProfile {
-    /// Build tuning hints from `wgpu::AdapterInfo`.
+    /// Build tuning hints from `crate::hal::AdapterInfo`.
     ///
     /// This is name-heuristic based because portable `wgpu` does not expose direct UMA metadata.
-    pub fn from_adapter_info(adapter_info: &wgpu::AdapterInfo) -> Self {
+    pub fn from_adapter_info(adapter_info: &crate::hal::AdapterInfo) -> Self {
         let name = adapter_info.name.to_ascii_lowercase();
         let is_linux_panthor_like = is_linux_panthor_adapter(adapter_info, &name);
         let is_apple_silicon_like = name.contains("apple")
@@ -239,8 +239,8 @@ fn panthor_module_present() -> bool {
     false
 }
 
-fn is_linux_panthor_adapter(adapter_info: &wgpu::AdapterInfo, name_lower: &str) -> bool {
-    if !matches!(adapter_info.backend, wgpu::Backend::Vulkan) || !is_arm_mali_like(name_lower) {
+fn is_linux_panthor_adapter(adapter_info: &crate::hal::AdapterInfo, name_lower: &str) -> bool {
+    if !matches!(adapter_info.backend, crate::hal::Backend::Vulkan) || !is_arm_mali_like(name_lower) {
         return false;
     }
 
@@ -252,10 +252,10 @@ fn is_linux_panthor_adapter(adapter_info: &wgpu::AdapterInfo, name_lower: &str) 
 #[cfg(test)]
 mod tests {
     use crate::*;
-    use wgpu::DeviceType;
+    use crate::hal::DeviceType;
 
-    fn adapter(name: &str, backend: wgpu::Backend, device_type: DeviceType) -> wgpu::AdapterInfo {
-        wgpu::AdapterInfo {
+    fn adapter(name: &str, backend: crate::hal::Backend, device_type: DeviceType) -> crate::hal::AdapterInfo {
+        crate::hal::AdapterInfo {
             name: name.to_owned(),
             vendor: 0x13B5,
             device: 0,
@@ -272,7 +272,7 @@ mod tests {
 
     #[test]
     fn apple_profile_sets_apple_flag_only() {
-        let info = adapter("Apple M4", wgpu::Backend::Metal, DeviceType::IntegratedGpu);
+        let info = adapter("Apple M4", crate::hal::Backend::Metal, DeviceType::IntegratedGpu);
         let tuning = GmsRuntimeTuningProfile::from_adapter_info(&info);
         assert!(tuning.is_apple_silicon_like);
         assert!(!tuning.is_linux_panthor_like);
@@ -282,7 +282,7 @@ mod tests {
     fn panthor_profile_activates_for_arm_vulkan_driver_hint() {
         let mut info = adapter(
             "Mali-G610",
-            wgpu::Backend::Vulkan,
+            crate::hal::Backend::Vulkan,
             DeviceType::IntegratedGpu,
         );
         info.driver = "panthor".to_owned();

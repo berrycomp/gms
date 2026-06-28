@@ -21,7 +21,7 @@ use crate::hardware::{
     safe_default_required_limits_for_adapter, GpuAdapterProfile, GpuInventory, MemoryTopology,
 };
 use crate::SharedTransferKind;
-use wgpu::{Color, TextureFormat};
+use crate::hal::{Color, TextureFormat};
 
 /// Initialization policy for the multi-GPU executor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,11 +37,11 @@ pub struct MultiGpuExecutorConfig {
     /// Auto vs force behavior when a valid secondary GPU is not available.
     pub policy: MultiGpuInitPolicy,
     /// Present GPU adapter info (used to avoid selecting the same physical GPU as secondary).
-    pub primary_adapter_info: wgpu::AdapterInfo,
+    pub primary_adapter_info: crate::hal::AdapterInfo,
     /// Full discovered inventory (may include duplicate backends for the same physical GPU).
     pub inventory: GpuInventory,
     /// Primary/present GPU device handle used to allocate upload bridge resources.
-    pub primary_device: wgpu::Device,
+    pub primary_device: crate::hal::Device,
     /// Current frame width in pixels.
     pub frame_width: u32,
     /// Current frame height in pixels.
@@ -56,6 +56,10 @@ pub struct MultiGpuExecutorConfig {
     pub auto_min_projected_gain_pct: f64,
     /// Optional SXRC compression policy for persistent bridge host-ring segments.
     pub sxrc_compression: GmsSxrcCompressionConfig,
+    /// Tuning config for multi-GPU device selection and SM limits.
+    pub tuning: crate::bridge::MultiGpuTuningConfig,
+    /// Precompiled PTX string from WasmGpuCompiler for bare-metal compute pipelines.
+    pub ptx_payload: Option<String>,
 }
 
 /// Runtime/telemetry summary produced by the portable multi-GPU executor.
@@ -97,8 +101,8 @@ pub struct MultiGpuExecutorSummary {
 pub struct MultiGpuFrameSubmitResult {
     /// Number of synthetic secondary work units submitted this present interval.
     pub work_units: u32,
-    /// Submission index returned by `wgpu::Queue::submit` for sync registration.
-    pub submission_index: Option<wgpu::SubmissionIndex>,
+    /// Submission index returned by `crate::hal::Queue::submit` for sync registration.
+    pub submission_index: Option<crate::hal::SubmissionIndex>,
 }
 
 /// Portable explicit multi-GPU helper runtime.
@@ -109,9 +113,9 @@ pub struct MultiGpuFrameSubmitResult {
 pub struct MultiGpuExecutor {
     plan: MultiGpuDispatchPlan,
     secondary_profile: GpuAdapterProfile,
-    secondary_device: wgpu::Device,
-    secondary_queue: wgpu::Queue,
-    secondary_texture: wgpu::Texture,
+    secondary_device: crate::hal::Device,
+    secondary_queue: crate::hal::Queue,
+    secondary_texture: crate::hal::Texture,
     frame_width: u32,
     frame_height: u32,
     secondary_format: TextureFormat,
@@ -128,13 +132,16 @@ pub struct MultiGpuExecutor {
     vulkan_version_gate_enabled: bool,
     primary_vulkan_api_version: Option<VulkanApiVersion>,
     secondary_vulkan_api_version: Option<VulkanApiVersion>,
+    gms_scheduler: crate::scheduler::GmsScheduler,
+    ptx_payload: Option<String>,
+    compute_pipeline: Option<crate::hal::ComputePipeline>,
 }
 
 struct MultiGpuBridgeRuntime {
     host_ring: Vec<BridgeHostSegment>,
     compression: GmsSxrcCompressor,
-    _producer_readback_buffers: Vec<wgpu::Buffer>,
-    _consumer_upload_buffers: Vec<wgpu::Buffer>,
+    _producer_readback_buffers: Vec<crate::hal::Buffer>,
+    _consumer_upload_buffers: Vec<crate::hal::Buffer>,
     ring_cursor: usize,
 }
 
@@ -146,7 +153,7 @@ enum BridgeHostSegment {
 
 #[derive(Default)]
 struct MultiGpuSyncState {
-    pending_secondary_submissions: VecDeque<wgpu::SubmissionIndex>,
+    pending_secondary_submissions: VecDeque<crate::hal::SubmissionIndex>,
     poll_count: u64,
     wait_count: u64,
     wait_timeout_count: u64,
@@ -171,6 +178,8 @@ impl MultiGpuExecutor {
             workload_request,
             auto_min_projected_gain_pct,
             sxrc_compression,
+            tuning,
+            ptx_payload,
         } = config;
 
         let present_profile = match_inventory_profile(&inventory, &primary_adapter_info);
@@ -183,7 +192,7 @@ impl MultiGpuExecutor {
                 .cloned()
         });
 
-        let dispatcher = MultiGpuDispatcher::new(multi_gpu_inventory.clone());
+        let dispatcher = MultiGpuDispatcher::new(multi_gpu_inventory.clone(), tuning.clone());
         let plan = dispatcher.plan_dispatch(workload_request);
 
         let Some(secondary_assignment) = plan.secondary() else {
@@ -235,8 +244,7 @@ impl MultiGpuExecutor {
             };
         }
 
-        let instance = wgpu::Instance::default();
-        let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
+        let adapters = crate::hal::enumerate_adapters();
         let secondary_adapter = adapters
             .into_iter()
             .find(|adapter| {
@@ -269,11 +277,7 @@ impl MultiGpuExecutor {
         let (secondary_required_limits, _secondary_limit_clamp_report) =
             safe_default_required_limits_for_adapter(&secondary_adapter);
         let (secondary_device, secondary_queue) =
-            pollster::block_on(secondary_adapter.request_device(&wgpu::DeviceDescriptor {
-                label: Some("gms-multi-gpu-secondary-device"),
-                required_limits: secondary_required_limits,
-                ..Default::default()
-            }))?;
+            secondary_adapter.request_device();
 
         let secondary_texture = create_secondary_offscreen_texture(
             &secondary_device,
@@ -334,8 +338,22 @@ impl MultiGpuExecutor {
             .transpose()?;
 
         let mut sync_state = MultiGpuSyncState::default();
-        let _ = secondary_device.poll(wgpu::PollType::Poll);
+        let _ = secondary_device.poll(crate::hal::PollType::Poll);
         sync_state.poll_count = sync_state.poll_count.saturating_add(1);
+
+        let compute_pipeline = if let Some(ref ptx_str) = ptx_payload {
+            Some(secondary_device.create_compute_pipeline(&crate::hal::ComputePipelineDescriptor {
+                label: Some("gms_ptx_kernel"),
+                layout: None,
+                module: None,
+                ptx_payload: Some(ptx_str),
+                entry_point: Some("gms_wasm_kernel"),
+                cache: None,
+                compilation_options: crate::hal::PipelineCompilationOptions::default(),
+            }))
+        } else {
+            None
+        };
 
         Ok(Some(Self {
             plan,
@@ -359,6 +377,9 @@ impl MultiGpuExecutor {
             vulkan_version_gate_enabled: version_gate.enabled,
             primary_vulkan_api_version: version_gate.primary_version,
             secondary_vulkan_api_version: version_gate.secondary_version,
+            gms_scheduler: crate::scheduler::GmsScheduler::default(),
+            compute_pipeline,
+            ptx_payload,
         }))
     }
 
@@ -401,7 +422,7 @@ impl MultiGpuExecutor {
                 .cloned()
             {
                 self.sync_state.wait_count = self.sync_state.wait_count.saturating_add(1);
-                match self.secondary_device.poll(wgpu::PollType::Wait {
+                match self.secondary_device.poll(crate::hal::PollType::Wait {
                     submission_index: Some(oldest_submission),
                     timeout: Some(Duration::from_micros(125)),
                 }) {
@@ -409,7 +430,7 @@ impl MultiGpuExecutor {
                         let _ = self.sync_state.pending_secondary_submissions.pop_front();
                     }
                     Ok(_) => {}
-                    Err(wgpu::PollError::Timeout) => {
+                    Err(crate::hal::PollError::Timeout) => {
                         // Aggressive helper-lane policy:
                         // instead of dropping an entire secondary frame on wait timeout,
                         // release one oldest tracking slot and keep submitting.
@@ -419,10 +440,10 @@ impl MultiGpuExecutor {
                         self.sync_state.skipped_submission_count =
                             self.sync_state.skipped_submission_count.saturating_add(1);
                         timed_out_gate = true;
-                        let _ = self.secondary_device.poll(wgpu::PollType::Poll);
+                        let _ = self.secondary_device.poll(crate::hal::PollType::Poll);
                         self.sync_state.poll_count = self.sync_state.poll_count.saturating_add(1);
                     }
-                    Err(wgpu::PollError::WrongSubmissionIndex(_, _)) => {
+                    Err(crate::hal::PollError::WrongSubmissionIndex) => {
                         let _ = self.sync_state.pending_secondary_submissions.pop_front();
                     }
                 }
@@ -431,23 +452,80 @@ impl MultiGpuExecutor {
 
         let view = self
             .secondary_texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder =
-            self.secondary_device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("gms-multi-gpu-secondary-encoder"),
-                });
+            .create_view(&crate::hal::TextureViewDescriptor::default());
 
-        for _ in 0..self.secondary_work_units_per_present {
-            for _ in 0..self.secondary_passes_per_work_unit {
-                self.secondary_clear_phase =
-                    (self.secondary_clear_phase + 0.0175) % std::f64::consts::TAU;
-                encode_clear_pass(
-                    &mut encoder,
-                    &view,
-                    synthetic_clear_color(self.secondary_clear_phase),
-                );
-            }
+        // Use GMS Scheduler to distribute the command encoding workload across CPU cores.
+        // We create a separate command buffer for each chunk of work.
+        let device = self.secondary_device.clone();
+        let passes_per_unit = self.secondary_passes_per_work_unit;
+        let mut clear_phase = self.secondary_clear_phase;
+        let view_clone = view.clone();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        
+        let chunk_size = 8;
+        let total_workgroups = self.secondary_work_units_per_present;
+        let chunks = (total_workgroups + chunk_size.max(1) - 1) / chunk_size.max(1);
+
+        let pipeline_clone = self.compute_pipeline.clone();
+
+        for i in 0..chunks {
+            let start = i * chunk_size;
+            let count = if start + chunk_size > total_workgroups {
+                total_workgroups - start
+            } else {
+                chunk_size
+            };
+            
+            let device_clone = device.clone();
+            let view_ref = view_clone.clone();
+            let tx_clone = tx.clone();
+            let local_phase_start = clear_phase + (start as f64 * 0.0175 * passes_per_unit as f64);
+            let pipeline_ref = pipeline_clone.clone();
+            
+            self.gms_scheduler.submit_native(move || {
+                let mut encoder = device_clone.create_command_encoder(&crate::hal::CommandEncoderDescriptor {
+                    label: Some("gms-mgpu-chunk"),
+                });
+                
+                if let Some(ref pipeline) = pipeline_ref {
+                    // Dispatch the PTX compute pipeline!
+                    let mut cpass = encoder.begin_compute_pass(&crate::hal::ComputePassDescriptor {
+                        label: Some("gms_compute_pass"),
+                        timestamp_writes: None,
+                    });
+                    cpass.set_pipeline(pipeline);
+                    
+                    // Dispatch workgroups (count * passes_per_unit)
+                    let total_dispatches = count * passes_per_unit;
+                    cpass.dispatch_workgroups(total_dispatches, 1, 1);
+                } else {
+                    // Fallback to legacy clear pass simulation if no PTX
+                    let mut local_phase = local_phase_start;
+                    for _ in 0..count {
+                        for _ in 0..passes_per_unit {
+                            local_phase = (local_phase + 0.0175) % std::f64::consts::TAU;
+                            encode_clear_pass(
+                                &mut encoder,
+                                &view_ref,
+                                synthetic_clear_color(local_phase),
+                            );
+                        }
+                    }
+                }
+                
+                let _ = tx_clone.send(encoder.finish());
+            });
+        }
+        
+        // Wait for all encoding tasks to finish
+        self.gms_scheduler.wait_for_idle();
+
+        self.secondary_clear_phase = (self.secondary_clear_phase + (self.secondary_work_units_per_present as f64 * 0.0175 * self.secondary_passes_per_work_unit as f64)) % std::f64::consts::TAU;
+
+        let mut command_buffers = Vec::new();
+        while let Ok(cb) = rx.try_recv() {
+            command_buffers.push(cb);
         }
 
         // Portable `wgpu` cannot directly share textures across devices. Keep a warm host ring so
@@ -456,11 +534,16 @@ impl MultiGpuExecutor {
             bridge_runtime.touch_host_ring();
         }
 
-        let submission = self.secondary_queue.submit(Some(encoder.finish()));
+        // Submit all encoded command buffers
+        let mut submission = None;
+        for cb in command_buffers {
+            submission = Some(self.secondary_queue.submit(Some(cb)));
+        }
+        let submission = submission.unwrap_or_else(|| self.secondary_queue.submit(None));
         self.sync_state
             .pending_secondary_submissions
             .push_back(submission.clone());
-        let _ = self.secondary_device.poll(wgpu::PollType::Poll);
+        let _ = self.secondary_device.poll(crate::hal::PollType::Poll);
         self.sync_state.poll_count = self.sync_state.poll_count.saturating_add(1);
 
         self.total_secondary_work_units = self
@@ -545,7 +628,7 @@ impl MultiGpuExecutor {
     }
 
     /// Access the secondary device handle for explicit sync reconciliation.
-    pub fn secondary_device(&self) -> &wgpu::Device {
+    pub fn secondary_device(&self) -> &crate::hal::Device {
         &self.secondary_device
     }
 
@@ -740,8 +823,8 @@ fn initial_secondary_passes(cap: u32) -> u32 {
 
 fn build_multi_gpu_bridge_runtime(
     bridge: &crate::bridge::SharedTextureBridgePlan,
-    secondary_device: &wgpu::Device,
-    primary_device: &wgpu::Device,
+    secondary_device: &crate::hal::Device,
+    primary_device: &crate::hal::Device,
     secondary_profile: &GpuAdapterProfile,
     sxrc_compression: GmsSxrcCompressionConfig,
 ) -> Result<MultiGpuBridgeRuntime, Box<dyn Error>> {
@@ -758,7 +841,7 @@ fn build_multi_gpu_bridge_runtime(
 
     let producer_readback_buffers = (0..ring_segments)
         .map(|_slot| {
-            secondary_device.create_buffer(&wgpu::BufferDescriptor {
+            secondary_device.create_buffer(&crate::hal::BufferDescriptor {
                 label: Some(match bridge.transfer_kind {
                     SharedTransferKind::HostMappedBridge => "gms-mgpu-host-bridge-readback",
                     SharedTransferKind::UnifiedMemoryMirror => "gms-mgpu-unified-bridge-readback",
@@ -772,12 +855,12 @@ fn build_multi_gpu_bridge_runtime(
 
     let mut consumer_upload_usage = bridge.consumer_upload_buffer_usages;
     if matches!(secondary_profile.memory_topology, MemoryTopology::Unified) {
-        consumer_upload_usage |= wgpu::BufferUsages::COPY_DST;
+        consumer_upload_usage |= crate::hal::BufferUsages::COPY_DST;
     }
 
     let consumer_upload_buffers = (0..ring_segments)
         .map(|_| {
-            primary_device.create_buffer(&wgpu::BufferDescriptor {
+            primary_device.create_buffer(&crate::hal::BufferDescriptor {
                 label: Some("gms-mgpu-host-bridge-upload"),
                 size: segment_bytes,
                 usage: consumer_upload_usage,
@@ -796,38 +879,38 @@ fn build_multi_gpu_bridge_runtime(
 }
 
 fn create_secondary_offscreen_texture(
-    device: &wgpu::Device,
+    device: &crate::hal::Device,
     width: u32,
     height: u32,
     format: TextureFormat,
     label: Option<&str>,
-) -> wgpu::Texture {
-    device.create_texture(&wgpu::TextureDescriptor {
+) -> crate::hal::Texture {
+    device.create_texture(&crate::hal::TextureDescriptor {
         label,
-        size: wgpu::Extent3d {
+        size: crate::hal::Extent3d {
             width: width.max(1),
             height: height.max(1),
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
         sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
+        dimension: crate::hal::TextureDimension::D2,
         format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        usage: crate::hal::TextureUsages::RENDER_ATTACHMENT | crate::hal::TextureUsages::COPY_SRC,
         view_formats: &[],
     })
 }
 
-fn encode_clear_pass(encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, color: Color) {
-    let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+fn encode_clear_pass(encoder: &mut crate::hal::CommandEncoder, view: &crate::hal::TextureView, color: Color) {
+    let _pass = encoder.begin_render_pass(&crate::hal::RenderPassDescriptor {
         label: Some("gms-multi-gpu-secondary-pass"),
-        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+        color_attachments: &[Some(crate::hal::RenderPassColorAttachment {
             view,
             depth_slice: None,
             resolve_target: None,
-            ops: wgpu::Operations {
-                load: wgpu::LoadOp::Clear(color),
-                store: wgpu::StoreOp::Store,
+            ops: crate::hal::Operations {
+                load: crate::hal::LoadOp::Clear(color),
+                store: crate::hal::StoreOp::Store,
             },
         })],
         depth_stencil_attachment: None,
@@ -866,7 +949,7 @@ fn hsv_to_rgb(h: f64, s: f64, v: f64) -> (f64, f64, f64) {
     }
 }
 
-fn adapter_info_matches_profile(profile: &GpuAdapterProfile, info: &wgpu::AdapterInfo) -> bool {
+fn adapter_info_matches_profile(profile: &GpuAdapterProfile, info: &crate::hal::AdapterInfo) -> bool {
     profile.vendor_id == info.vendor
         && profile.device_id == info.device
         && profile.backend == info.backend
@@ -875,7 +958,7 @@ fn adapter_info_matches_profile(profile: &GpuAdapterProfile, info: &wgpu::Adapte
 
 fn match_inventory_profile(
     inventory: &GpuInventory,
-    adapter_info: &wgpu::AdapterInfo,
+    adapter_info: &crate::hal::AdapterInfo,
 ) -> Option<GpuAdapterProfile> {
     inventory
         .adapters
@@ -959,11 +1042,11 @@ struct VulkanVersionGate {
 }
 
 fn validate_vulkan_version_compatibility(
-    primary: &wgpu::AdapterInfo,
-    secondary: &wgpu::AdapterInfo,
+    primary: &crate::hal::AdapterInfo,
+    secondary: &crate::hal::AdapterInfo,
 ) -> Result<VulkanVersionGate, String> {
-    if !matches!(primary.backend, wgpu::Backend::Vulkan)
-        || !matches!(secondary.backend, wgpu::Backend::Vulkan)
+    if !matches!(primary.backend, crate::hal::Backend::Vulkan)
+        || !matches!(secondary.backend, crate::hal::Backend::Vulkan)
     {
         return Ok(VulkanVersionGate {
             enabled: false,
@@ -1000,8 +1083,8 @@ fn validate_vulkan_version_compatibility(
     }
 }
 
-fn parse_adapter_vulkan_api_version(info: &wgpu::AdapterInfo) -> Option<VulkanApiVersion> {
-    if !matches!(info.backend, wgpu::Backend::Vulkan) {
+fn parse_adapter_vulkan_api_version(info: &crate::hal::AdapterInfo) -> Option<VulkanApiVersion> {
+    if !matches!(info.backend, crate::hal::Backend::Vulkan) {
         return None;
     }
     parse_vulkan_api_version_from_text(&info.driver_info)
@@ -1113,7 +1196,7 @@ struct VulkanInfoApiVersionEntry {
     api_version: VulkanApiVersion,
 }
 
-fn probe_vulkaninfo_api_version(info: &wgpu::AdapterInfo) -> Option<VulkanApiVersion> {
+fn probe_vulkaninfo_api_version(info: &crate::hal::AdapterInfo) -> Option<VulkanApiVersion> {
     static CACHE: OnceLock<Vec<VulkanInfoApiVersionEntry>> = OnceLock::new();
     let entries = CACHE.get_or_init(load_vulkaninfo_api_version_entries);
     if entries.is_empty() {
@@ -1301,7 +1384,7 @@ fn parse_first_u32_hex_or_decimal(text: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wgpu::{AdapterInfo, Backend, DeviceType};
+    use crate::hal::{AdapterInfo, Backend, DeviceType};
 
     #[test]
     fn bridge_segment_stores_compressed_when_payload_is_repetitive() {
@@ -1419,7 +1502,7 @@ GPU1:
 }
 
 fn build_no_secondary_assignment_diagnostic(
-    primary_adapter_info: &wgpu::AdapterInfo,
+    primary_adapter_info: &crate::hal::AdapterInfo,
     raw_inventory: &GpuInventory,
     deduped_inventory: &GpuInventory,
     plan: &MultiGpuDispatchPlan,

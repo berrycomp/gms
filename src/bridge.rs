@@ -8,7 +8,7 @@ use crate::hardware::{
     ComputeUnitEstimateSource, ComputeUnitKind, GpuAdapterProfile, GpuInventory, MemoryTopology,
 };
 use crate::GmsSxrcCompressionConfig;
-use wgpu::{BufferUsages, TextureUsages};
+use crate::hal::{BufferUsages, TextureUsages};
 
 /// Input workload description for a frame or simulation step.
 #[derive(Debug, Clone, Copy)]
@@ -256,6 +256,8 @@ pub struct MultiGpuWorkloadRequest {
     pub base_workgroup_size: u32,
     /// Target frame budget used to cap secondary latency work (e.g. 0.26ms or 16.67ms).
     pub target_frame_budget_ms: f64,
+    /// Indicates whether SXRC HEX4 (4-bit) compression is active, reducing sizes by 50%.
+    pub hex4_enabled: bool,
 }
 
 impl Default for MultiGpuWorkloadRequest {
@@ -276,6 +278,7 @@ impl Default for MultiGpuWorkloadRequest {
             processed_texture_bytes_per_frame: 8 * 1024 * 1024,
             base_workgroup_size: 64,
             target_frame_budget_ms: 16.67,
+            hex4_enabled: false,
         }
     }
 }
@@ -323,19 +326,26 @@ impl MultiGpuDispatchPlan {
 #[derive(Debug, Clone)]
 pub struct MultiGpuDispatcher {
     inventory: GpuInventory,
+    pub tuning: MultiGpuTuningConfig,
+}
+#[derive(Debug, Clone, Default)]
+pub struct MultiGpuTuningConfig {
+    pub allowed_device_names: Option<Vec<String>>,
+    pub sm_utilization_target_pct: Option<f32>,
 }
 
 impl MultiGpuDispatcher {
     /// Discover adapters and build a multi-GPU dispatcher.
-    pub fn discover() -> Self {
+    pub fn discover(tuning: MultiGpuTuningConfig) -> Self {
         Self {
             inventory: GpuInventory::discover(),
+            tuning,
         }
     }
 
     /// Build from a precomputed inventory.
-    pub fn new(inventory: GpuInventory) -> Self {
-        Self { inventory }
+    pub fn new(inventory: GpuInventory, tuning: MultiGpuTuningConfig) -> Self {
+        Self { inventory, tuning }
     }
 
     /// Access discovered inventory.
@@ -350,8 +360,28 @@ impl MultiGpuDispatcher {
     /// - UI/Post-FX are biased to the secondary adapter for overlap.
     /// - Secondary latency work is capped by a target frame budget; overflow spills back.
     pub fn plan_dispatch(&self, request: MultiGpuWorkloadRequest) -> MultiGpuDispatchPlan {
-        let usable = self.inventory.usable_adapters().collect::<Vec<_>>();
-        let total_usable_score = self.inventory.total_usable_score().max(1);
+        let usable = self.inventory.usable_adapters()
+            .filter(|gpu| {
+                if let Some(allowed) = &self.tuning.allowed_device_names {
+                    allowed.iter().any(|name| gpu.name.to_ascii_lowercase().contains(&name.to_ascii_lowercase()))
+                } else {
+                    true
+                }
+            })
+            .collect::<Vec<_>>();
+
+        // Apply SM utilization limit logic
+        let sm_pct = self.tuning.sm_utilization_target_pct.unwrap_or(1.0).clamp(0.01, 1.0) as f64;
+        let mut scaled_scores = Vec::with_capacity(usable.len());
+        let mut total_usable_score = 0;
+        
+        for gpu in &usable {
+            let scaled_score = (gpu.score as f64 * sm_pct).round() as u64;
+            scaled_scores.push(scaled_score);
+            total_usable_score += scaled_score.max(1);
+        }
+
+        let total_usable_score = total_usable_score.max(1);
 
         if usable.is_empty() {
             return MultiGpuDispatchPlan {
@@ -470,8 +500,8 @@ impl MultiGpuDispatcher {
             };
 
             let sampled_processing_jobs = sampled_distribution[slot];
-            let object_updates = object_distribution[slot];
-            let physics_jobs = physics_distribution[slot];
+            let object_updates = object_distribution[slot] as u32;
+            let physics_jobs = physics_distribution[slot] as u32;
             let ai_ml_jobs = ai_ml_distribution[slot];
             let ui_jobs = ui_distribution[slot];
             let post_fx_jobs = post_fx_distribution[slot];
@@ -603,6 +633,7 @@ impl MultiGpuDispatcher {
 #[derive(Debug, Clone)]
 pub struct GmsDispatcher {
     inventory: GpuInventory,
+    pub tuning: MultiGpuTuningConfig,
 }
 
 fn default_sync_plan(target_frame_budget_ms: f64) -> MultiGpuSyncPlan {
@@ -871,7 +902,7 @@ fn aggressive_secondary_target_share(
         relative.sqrt() * scale
     };
 
-    (base + weak_helper_guard + dual_discrete_bonus).clamp(base, max_share)
+    ((base + weak_helper_guard + dual_discrete_bonus) as f64).clamp(base as f64, max_share as f64)
 }
 
 fn move_lane_jobs(
@@ -965,7 +996,14 @@ fn estimate_multi_gpu_assigned_bytes(
         .saturating_add((ai_ml_jobs as u64).saturating_mul(request.bytes_per_ai_ml_job))
         .saturating_add((ui_jobs as u64).saturating_mul(request.bytes_per_ui_job))
         .saturating_add((post_fx_jobs as u64).saturating_mul(request.bytes_per_post_fx_job));
-    round_up_u64(total, 256)
+    
+    let scaled_total = if request.hex4_enabled {
+        total / 2
+    } else {
+        total
+    };
+
+    round_up_u64(scaled_total, 256)
 }
 
 fn build_shared_texture_bridge_plan(
@@ -983,8 +1021,14 @@ fn build_shared_texture_bridge_plan(
         return None;
     }
 
+    let scaled_texture_bytes = if request.hex4_enabled {
+        request.processed_texture_bytes_per_frame / 2
+    } else {
+        request.processed_texture_bytes_per_frame
+    };
+
     let bytes_per_frame = round_up_u64(
-        request.processed_texture_bytes_per_frame.max(
+        scaled_texture_bytes.max(
             secondary_assignment
                 .zero_copy
                 .device_bytes
@@ -1095,16 +1139,20 @@ fn build_multi_gpu_sync_plan(
 }
 
 impl GmsDispatcher {
-    /// Discover adapters and build a dispatcher.
+    /// Discover adapters and build a multi-GPU dispatcher.
     pub fn discover() -> Self {
         Self {
             inventory: GpuInventory::discover(),
+            tuning: MultiGpuTuningConfig::default(),
         }
     }
 
     /// Build from a precomputed inventory.
     pub fn new(inventory: GpuInventory) -> Self {
-        Self { inventory }
+        Self { 
+            inventory,
+            tuning: MultiGpuTuningConfig::default(),
+        }
     }
 
     /// Access discovered inventory.
@@ -1144,8 +1192,8 @@ impl GmsDispatcher {
             .iter()
             .enumerate()
             .map(|(slot, gpu)| {
-                let object_updates = object_distribution[slot];
-                let physics_jobs = physics_distribution[slot];
+                let object_updates = object_distribution[slot] as u32;
+                let physics_jobs = physics_distribution[slot] as u32;
                 let total_jobs = object_updates.saturating_add(physics_jobs);
                 let workgroup_size =
                     select_workgroup_size(*gpu, best_score, request.base_workgroup_size);
@@ -1190,26 +1238,10 @@ fn allocate_weighted_counts(total: u32, weights: &[f64]) -> Vec<u32> {
 
     let normalized_sum = weights.iter().copied().sum::<f64>().max(f64::EPSILON);
     let mut base = Vec::with_capacity(weights.len());
-    let mut remainders = Vec::with_capacity(weights.len());
-    let mut assigned = 0u32;
 
-    for (index, weight) in weights.iter().copied().enumerate() {
+    for weight in weights.iter().copied() {
         let exact = (total as f64) * (weight / normalized_sum);
-        let floor = exact.floor() as u32;
-        base.push(floor);
-        remainders.push((index, exact - floor as f64));
-        assigned = assigned.saturating_add(floor);
-    }
-
-    remainders.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    let mut remaining = total.saturating_sub(assigned);
-    for (index, _) in remainders {
-        if remaining == 0 {
-            break;
-        }
-        base[index] = base[index].saturating_add(1);
-        remaining -= 1;
+        base.push(exact.round() as u32);
     }
 
     base
@@ -1365,8 +1397,8 @@ fn unit_parallelism_factor(gpu: &GpuAdapterProfile, class: TaskClass) -> f64 {
     };
 
     let raw = (units / baseline_units).powf(class_exponent) * kind_bias;
-    let blended = 1.0 + (raw - 1.0) * source_confidence;
-    blended.clamp(0.70, 2.40)
+    let blended: f32 = 1.0 + (raw as f32 - 1.0) * source_confidence as f32;
+    blended.clamp(0.70_f32, 2.40_f32) as f64
 }
 
 fn prev_power_of_two(value: u32) -> u32 {

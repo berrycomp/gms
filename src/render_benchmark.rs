@@ -9,7 +9,7 @@ use crate::{
     GpuInventory, MultiGpuExecutor, MultiGpuExecutorConfig, MultiGpuExecutorSummary,
     MultiGpuInitPolicy, MultiGpuWorkloadRequest,
 };
-use wgpu::{Color, CompositeAlphaMode, PresentMode, SurfaceError, TextureFormat};
+use crate::hal::{Color, CompositeAlphaMode, PresentMode, SurfaceError, TextureFormat};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
@@ -417,7 +417,9 @@ impl BenchmarkRuntime {
                 primary_work_units_per_present: renderer.work_units_per_present(),
                 workload_request,
                 auto_min_projected_gain_pct: 5.0,
-                sxrc_compression: GmsSxrcCompressionConfig::from_tileline_env(),
+                sxrc_compression: GmsSxrcCompressionConfig::default(),
+                tuning: crate::bridge::MultiGpuTuningConfig::default(),
+                ptx_payload: None,
             })?
         };
 
@@ -696,21 +698,22 @@ fn build_multi_gpu_workload_request(
             .clamp(512 * 1024, 64 * 1024 * 1024),
         base_workgroup_size: 64,
         target_frame_budget_ms,
+        hex4_enabled: crate::GmsSxrcCompressionConfig::enabled_for_runtime().enabled,
     }
 }
 
 struct Renderer {
-    _instance: wgpu::Instance,
-    surface: wgpu::Surface<'static>,
-    adapter_info: wgpu::AdapterInfo,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
+    _instance: crate::hal::Instance,
+    surface: crate::hal::Surface<'static>,
+    adapter_info: crate::hal::AdapterInfo,
+    device: crate::hal::Device,
+    queue: crate::hal::Queue,
+    config: crate::hal::SurfaceConfiguration,
     size: PhysicalSize<u32>,
     present_mode: PresentMode,
     clear_phase: f64,
     throughput_burst: Option<ThroughputBurst>,
-    throughput_targets: Vec<wgpu::Texture>,
+    throughput_targets: Vec<crate::hal::Texture>,
     throughput_target_cursor: usize,
     primary_stress: PrimaryStressKernel,
     runtime_tuning: GmsRuntimeTuningProfile,
@@ -725,9 +728,9 @@ struct ThroughputBurst {
 }
 
 struct PrimaryStressKernel {
-    pipeline: wgpu::ComputePipeline,
-    bind_groups: Vec<wgpu::BindGroup>,
-    params_buffer: wgpu::Buffer,
+    pipeline: crate::hal::ComputePipeline,
+    bind_groups: Vec<crate::hal::BindGroup>,
+    params_buffer: crate::hal::Buffer,
     element_count: u32,
     dispatch_groups: u32,
     ring_cursor: usize,
@@ -735,8 +738,8 @@ struct PrimaryStressKernel {
 
 impl PrimaryStressKernel {
     fn new(
-        device: &wgpu::Device,
-        adapter_info: &wgpu::AdapterInfo,
+        device: &crate::hal::Device,
+        adapter_info: &crate::hal::AdapterInfo,
         size: PhysicalSize<u32>,
         ring_len_hint: usize,
     ) -> Self {
@@ -744,29 +747,29 @@ impl PrimaryStressKernel {
         let dispatch_groups = ceil_div_u32(element_count.max(1), 128).max(1);
         let ring_len = ring_len_hint.clamp(2, 8);
 
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let shader = device.create_shader_module(crate::hal::ShaderModuleDescriptor {
             label: Some("gms-primary-stress-shader"),
-            source: wgpu::ShaderSource::Wgsl(PRIMARY_STRESS_WGSL.into()),
+            source: crate::hal::ShaderSource::Wgsl(PRIMARY_STRESS_WGSL.into()),
         });
 
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        let bind_group_layout = device.create_bind_group_layout(&crate::hal::BindGroupLayoutDescriptor {
             label: Some("gms-primary-stress-bgl"),
             entries: &[
-                wgpu::BindGroupLayoutEntry {
+                crate::hal::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    visibility: crate::hal::ShaderStages::COMPUTE,
+                    ty: crate::hal::BindingType::Buffer {
+                        ty: crate::hal::BufferBindingType::Storage { read_only: false },
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
                     count: None,
                 },
-                wgpu::BindGroupLayoutEntry {
+                crate::hal::BindGroupLayoutEntry {
                     binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
+                    visibility: crate::hal::ShaderStages::COMPUTE,
+                    ty: crate::hal::BindingType::Buffer {
+                        ty: crate::hal::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
@@ -775,48 +778,50 @@ impl PrimaryStressKernel {
             ],
         });
 
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        let pipeline_layout = device.create_pipeline_layout(&crate::hal::PipelineLayoutDescriptor {
             label: Some("gms-primary-stress-pipeline-layout"),
             bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
             immediate_size: 0,
         });
 
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("gms-primary-stress-pipeline"),
+        let pipeline = device.create_compute_pipeline(&crate::hal::ComputePipelineDescriptor {
+            label: Some("main_compute_pipeline"),
             layout: Some(&pipeline_layout),
-            module: &shader,
+            module: Some(&shader),
+            ptx_payload: None,
             entry_point: Some("main"),
             cache: None,
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            compilation_options: crate::hal::PipelineCompilationOptions::default(),
         });
 
-        let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        let params_buffer = device.create_buffer(&crate::hal::BufferDescriptor {
             label: Some("gms-primary-stress-params"),
             size: 16,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            usage: crate::hal::BufferUsages::UNIFORM | crate::hal::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
         let payload_bytes = (element_count as u64).saturating_mul(16).max(16);
         let mut bind_groups = Vec::with_capacity(ring_len);
         for idx in 0..ring_len {
-            let payload = device.create_buffer(&wgpu::BufferDescriptor {
+            let payload = device.create_buffer(&crate::hal::BufferDescriptor {
                 label: Some("gms-primary-stress-payload"),
                 size: payload_bytes,
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::COPY_SRC,
+                usage: crate::hal::BufferUsages::STORAGE
+                    | crate::hal::BufferUsages::COPY_DST
+                    | crate::hal::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             });
-            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            let bind_group = device.create_bind_group(&crate::hal::BindGroupDescriptor {
                 label: Some("gms-primary-stress-bg"),
                 layout: &bind_group_layout,
                 entries: &[
-                    wgpu::BindGroupEntry {
+                    crate::hal::BindGroupEntry {
                         binding: 0,
                         resource: payload.as_entire_binding(),
                     },
-                    wgpu::BindGroupEntry {
+                    crate::hal::BindGroupEntry {
                         binding: 1,
                         resource: params_buffer.as_entire_binding(),
                     },
@@ -838,7 +843,7 @@ impl PrimaryStressKernel {
 
     fn write_params(
         &self,
-        queue: &wgpu::Queue,
+        queue: &crate::hal::Queue,
         phase: f32,
         amplitude: f32,
         len: u32,
@@ -852,13 +857,13 @@ impl PrimaryStressKernel {
         queue.write_buffer(&self.params_buffer, 0, &bytes);
     }
 
-    fn encode_one(&mut self, encoder: &mut wgpu::CommandEncoder) {
+    fn encode_one(&mut self, encoder: &mut crate::hal::CommandEncoder) {
         if self.bind_groups.is_empty() {
             return;
         }
         let idx = self.ring_cursor % self.bind_groups.len();
         self.ring_cursor = self.ring_cursor.wrapping_add(1);
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        let mut pass = encoder.begin_compute_pass(&crate::hal::ComputePassDescriptor {
             label: Some("gms-primary-stress-pass"),
             timestamp_writes: None,
         });
@@ -871,14 +876,14 @@ impl PrimaryStressKernel {
 impl Renderer {
     fn new(window: Arc<Window>, options: CliOptions) -> Result<Self, Box<dyn Error>> {
         let size = window.inner_size();
-        let instance = wgpu::Instance::default();
+        let instance = crate::hal::Instance::default();
         let surface = instance.create_surface(Arc::clone(&window))?;
 
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
+        let adapter = pollster::block_on(instance.request_adapter(&crate::hal::RequestAdapterOptions {
+            power_preference: crate::hal::PowerPreference::HighPerformance,
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
-        }))?;
+        })).ok_or_else(|| Box::<dyn Error>::from("No adapter found"))?;
 
         let adapter_info = adapter.get_info();
         let runtime_tuning = GmsRuntimeTuningProfile::from_adapter_info(&adapter_info);
@@ -900,11 +905,7 @@ impl Renderer {
             );
         }
         let (device, queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-                label: Some("gms-render-benchmark-device"),
-                required_limits,
-                ..Default::default()
-            }))?;
+            adapter.request_device();
 
         let capabilities = surface.get_capabilities(&adapter);
         let mut config = surface
@@ -923,7 +924,7 @@ impl Renderer {
             VsyncOverride::On => true,
             VsyncOverride::Off => false,
             VsyncOverride::Auto => {
-                matches!(adapter_info.device_type, wgpu::DeviceType::IntegratedGpu)
+                matches!(adapter_info.device_type, crate::hal::DeviceType::IntegratedGpu)
             }
         };
         config.present_mode = select_present_mode(
@@ -1018,11 +1019,11 @@ impl Renderer {
             .map_err(RenderOutcome::from)?;
         let view = frame
             .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+            .create_view(&crate::hal::TextureViewDescriptor::default());
 
         let mut encoder = self
             .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            .create_command_encoder(&crate::hal::CommandEncoderDescriptor {
                 label: Some("gms-render-benchmark-encoder"),
             });
 
@@ -1075,7 +1076,7 @@ impl Renderer {
             )
     }
 
-    fn current_throughput_target(&mut self) -> Option<&wgpu::Texture> {
+    fn current_throughput_target(&mut self) -> Option<&crate::hal::Texture> {
         if self.throughput_targets.is_empty() {
             return None;
         }
@@ -1114,21 +1115,21 @@ impl Renderer {
         self.throughput_targets.reserve(desired_ring_len);
         for slot in 0..desired_ring_len {
             self.throughput_targets
-                .push(self.device.create_texture(&wgpu::TextureDescriptor {
+                .push(self.device.create_texture(&crate::hal::TextureDescriptor {
                     label: Some(match self.runtime_tuning.prefer_unified_memory_tuning {
                         true => "gms-render-benchmark-throughput-target-uma",
                         false => "gms-render-benchmark-throughput-target",
                     }),
-                    size: wgpu::Extent3d {
+                    size: crate::hal::Extent3d {
                         width: self.size.width.max(1),
                         height: self.size.height.max(1),
                         depth_or_array_layers: 1,
                     },
                     mip_level_count: 1,
                     sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
+                    dimension: crate::hal::TextureDimension::D2,
                     format: self.config.format,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    usage: crate::hal::TextureUsages::RENDER_ATTACHMENT,
                     view_formats: &[],
                 }));
             let _ = slot;
@@ -1157,10 +1158,10 @@ impl Renderer {
             let Some(target) = self.current_throughput_target() else {
                 break;
             };
-            let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+            let target_view = target.create_view(&crate::hal::TextureViewDescriptor::default());
             let mut encoder = self
                 .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                .create_command_encoder(&crate::hal::CommandEncoderDescriptor {
                     label: Some("gms-render-benchmark-throughput-prewarm-encoder"),
                 });
             for _ in 0..self.passes_per_work_unit() {
@@ -1174,7 +1175,7 @@ impl Renderer {
             self.queue.submit(Some(encoder.finish()));
         }
 
-        let _ = self.device.poll(wgpu::PollType::Poll);
+        let _ = self.device.poll(crate::hal::PollType::Poll);
     }
 }
 
@@ -1206,16 +1207,16 @@ fn hsv_to_rgb(h: f64, s: f64, v: f64) -> (f64, f64, f64) {
     }
 }
 
-fn encode_clear_pass(encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, color: Color) {
-    let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+fn encode_clear_pass(encoder: &mut crate::hal::CommandEncoder, view: &crate::hal::TextureView, color: Color) {
+    let _pass = encoder.begin_render_pass(&crate::hal::RenderPassDescriptor {
         label: Some("gms-render-benchmark-pass"),
-        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+        color_attachments: &[Some(crate::hal::RenderPassColorAttachment {
             view,
             depth_slice: None,
             resolve_target: None,
-            ops: wgpu::Operations {
-                load: wgpu::LoadOp::Clear(color),
-                store: wgpu::StoreOp::Store,
+            ops: crate::hal::Operations {
+                load: crate::hal::LoadOp::Clear(color),
+                store: crate::hal::StoreOp::Store,
             },
         })],
         depth_stencil_attachment: None,
@@ -1282,7 +1283,7 @@ fn select_present_mode(
 }
 
 fn select_throughput_burst(
-    adapter_info: &wgpu::AdapterInfo,
+    adapter_info: &crate::hal::AdapterInfo,
     runtime_tuning: &GmsRuntimeTuningProfile,
     options: CliOptions,
     present_mode: PresentMode,
@@ -1292,7 +1293,7 @@ fn select_throughput_burst(
         ModeOverride::Max => true,
         ModeOverride::Auto => !matches!(
             adapter_info.device_type,
-            wgpu::DeviceType::IntegratedGpu | wgpu::DeviceType::Cpu
+            crate::hal::DeviceType::IntegratedGpu | crate::hal::DeviceType::Cpu
         ),
     };
 
@@ -1301,13 +1302,13 @@ fn select_throughput_burst(
     }
 
     let base_units = match adapter_info.device_type {
-        wgpu::DeviceType::DiscreteGpu => 64,
-        wgpu::DeviceType::VirtualGpu => 16,
+        crate::hal::DeviceType::DiscreteGpu => 64,
+        crate::hal::DeviceType::VirtualGpu => 16,
         _ => runtime_tuning.integrated_throughput_burst_work_units,
     };
     let max_units = match adapter_info.device_type {
-        wgpu::DeviceType::DiscreteGpu => 768,
-        wgpu::DeviceType::VirtualGpu => 128,
+        crate::hal::DeviceType::DiscreteGpu => 768,
+        crate::hal::DeviceType::VirtualGpu => 128,
         _ => {
             if runtime_tuning.is_linux_panthor_like {
                 192
@@ -1325,11 +1326,11 @@ fn select_throughput_burst(
         PresentMode::Fifo | PresentMode::FifoRelaxed | PresentMode::AutoVsync
     );
     let target_pixels_per_present = match adapter_info.device_type {
-        wgpu::DeviceType::DiscreteGpu => match options.mode_override {
+        crate::hal::DeviceType::DiscreteGpu => match options.mode_override {
             ModeOverride::Max => 320_000_000u64,
             _ => 220_000_000u64,
         },
-        wgpu::DeviceType::VirtualGpu => 90_000_000u64,
+        crate::hal::DeviceType::VirtualGpu => 90_000_000u64,
         _ => {
             if vsync_locked {
                 140_000_000u64
@@ -1353,7 +1354,7 @@ fn select_throughput_burst(
 }
 
 fn select_primary_passes_per_work_unit(
-    adapter_info: &wgpu::AdapterInfo,
+    adapter_info: &crate::hal::AdapterInfo,
     runtime_tuning: &GmsRuntimeTuningProfile,
     options: CliOptions,
     present_mode: PresentMode,
@@ -1367,7 +1368,7 @@ fn select_primary_passes_per_work_unit(
     );
 
     let (target_pixels_per_wu, max_passes) = match adapter_info.device_type {
-        wgpu::DeviceType::DiscreteGpu => (
+        crate::hal::DeviceType::DiscreteGpu => (
             match options.mode_override {
                 ModeOverride::Max => 6_000_000u64,
                 ModeOverride::Stable => 2_000_000u64,
@@ -1375,7 +1376,7 @@ fn select_primary_passes_per_work_unit(
             },
             12u32,
         ),
-        wgpu::DeviceType::VirtualGpu => (3_000_000u64, 8u32),
+        crate::hal::DeviceType::VirtualGpu => (3_000_000u64, 8u32),
         _ => (
             if vsync_locked {
                 2_500_000u64
@@ -1395,17 +1396,17 @@ fn select_primary_passes_per_work_unit(
 }
 
 fn select_primary_stress_elements(
-    adapter_info: &wgpu::AdapterInfo,
+    adapter_info: &crate::hal::AdapterInfo,
     size: PhysicalSize<u32>,
 ) -> u32 {
     let pixels = (size.width.max(1) as u64)
         .saturating_mul(size.height.max(1) as u64)
         .max(262_144);
     match adapter_info.device_type {
-        wgpu::DeviceType::DiscreteGpu => {
+        crate::hal::DeviceType::DiscreteGpu => {
             (pixels.saturating_mul(4)).clamp(1_048_576, 8_388_608) as u32
         }
-        wgpu::DeviceType::VirtualGpu => (pixels.saturating_mul(2)).clamp(524_288, 2_097_152) as u32,
+        crate::hal::DeviceType::VirtualGpu => (pixels.saturating_mul(2)).clamp(524_288, 2_097_152) as u32,
         _ => (pixels.saturating_mul(2)).clamp(524_288, 4_194_304) as u32,
     }
 }
@@ -1461,7 +1462,7 @@ fn title_update_interval(tuning: &GmsRuntimeTuningProfile) -> Duration {
 
 fn match_inventory_profile(
     inventory: &GpuInventory,
-    adapter_info: &wgpu::AdapterInfo,
+    adapter_info: &crate::hal::AdapterInfo,
 ) -> Option<crate::GpuAdapterProfile> {
     inventory
         .adapters
@@ -2000,7 +2001,7 @@ enum BenchmarkPacingMode {
 
 fn choose_pacing_mode(
     profile: Option<&crate::GpuAdapterProfile>,
-    adapter_info: &wgpu::AdapterInfo,
+    adapter_info: &crate::hal::AdapterInfo,
     options: CliOptions,
 ) -> BenchmarkPacingMode {
     match options.mode_override {
@@ -2015,7 +2016,7 @@ fn choose_pacing_mode(
         }
     }
 
-    if matches!(adapter_info.device_type, wgpu::DeviceType::IntegratedGpu) {
+    if matches!(adapter_info.device_type, crate::hal::DeviceType::IntegratedGpu) {
         BenchmarkPacingMode::Stable
     } else {
         BenchmarkPacingMode::MaxThroughput

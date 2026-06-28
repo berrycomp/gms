@@ -124,7 +124,7 @@ fn generic_engine_manifest() -> SxrcManifest {
         static_dictionary: vec![],
         instruction_patterns: vec![],
         memory_markers: std::collections::BTreeMap::new(),
-        hex4: None,
+        hex4: Some(sxrc::Hex4Config::default()),
         runtime: None,
         policies: vec![],
     }
